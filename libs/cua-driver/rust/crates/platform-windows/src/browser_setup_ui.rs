@@ -32,9 +32,7 @@ fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefus
 }
 
 fn release_nodes(nodes: &[UiaNode]) {
-    for node in nodes.iter().filter(|node| node.element_ptr != 0) {
-        unsafe { drop(IUIAutomationElement::from_raw(node.element_ptr as *mut _)) };
-    }
+    let _ = nodes;
 }
 
 /// Browser chrome only: tab strip, toolbar, omnibox, and the active tab's
@@ -779,6 +777,7 @@ mod tests {
             enabled: None,
             selected: None,
             element_ptr: 7,
+            owns_element_ptr: false,
             center_x: 0,
             center_y: 0,
             rect: None,

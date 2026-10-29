@@ -28,7 +28,7 @@
 //! replaces + releases → B dereferences) with channels instead of relying on
 //! luck.
 
-use super::{RetainedElement, SnapshotKind, Snapshots, UiaSnapshot};
+use super::{RetainedElement, SnapshotKind, Snapshots, UiaNode, UiaSnapshot};
 use cua_driver_core::element_token::{token_for, ResolvedElement};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
@@ -104,6 +104,41 @@ fn make_fake(uaf_hits: &'static AtomicUsize) -> usize {
     Box::into_raw(obj) as usize
 }
 
+fn fake_refcount(ptr: usize) -> isize {
+    unsafe { (*(ptr as *const FakeObj)).refcount.load(Ordering::SeqCst) }
+}
+
+fn walk_node(ptr: usize, actionable: bool) -> UiaNode {
+    UiaNode {
+        element_index: actionable.then_some(0),
+        control_type: if actionable {
+            "Button".to_owned()
+        } else {
+            "Text".to_owned()
+        },
+        name: Some("fixture".to_owned()),
+        value: None,
+        automation_id: None,
+        help_text: None,
+        actions: if actionable {
+            vec!["invoke".to_owned()]
+        } else {
+            Vec::new()
+        },
+        enabled: Some(true),
+        selected: None,
+        element_ptr: ptr,
+        owns_element_ptr: true,
+        center_x: 0,
+        center_y: 0,
+        rect: None,
+        msaa_role: None,
+        depth: 0,
+        parent_element_index: None,
+        in_web_content: false,
+    }
+}
+
 fn snapshot_with(ptrs: Vec<usize>) -> UiaSnapshot {
     UiaSnapshot {
         elements: ptrs
@@ -144,6 +179,26 @@ unsafe fn touch_vtable(ptr: usize) {
 
 const PID: u32 = 4242;
 const HWND: u64 = (1_u64 << 40) | 0x1234;
+
+#[test]
+fn walk_nodes_and_snapshots_balance_every_uia_reference() {
+    let uaf_hits: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let actionable_ptr = make_fake(uaf_hits);
+    let text_ptr = make_fake(uaf_hits);
+    let nodes = vec![walk_node(actionable_ptr, true), walk_node(text_ptr, false)];
+
+    let snapshot = UiaSnapshot::from_nodes(&nodes, SnapshotKind::Uia);
+    assert_eq!(fake_refcount(actionable_ptr), 2);
+    assert_eq!(fake_refcount(text_ptr), 1);
+
+    drop(nodes);
+    assert_eq!(fake_refcount(actionable_ptr), 1);
+    assert_eq!(fake_refcount(text_ptr), 0);
+
+    drop(snapshot);
+    assert_eq!(fake_refcount(actionable_ptr), 0);
+    assert_eq!(uaf_hits.load(Ordering::SeqCst), 0);
+}
 
 /// Forced interleave: B looks up the element, THEN A replaces+releases the
 /// snapshot, THEN B dereferences through its retained guard. Returns the

@@ -13,6 +13,7 @@ fn node(actions: Vec<String>) -> UiaNode {
         enabled: Some(true),
         selected: None,
         element_ptr: 0,
+        owns_element_ptr: false,
         center_x: 0,
         center_y: 0,
         rect: None,

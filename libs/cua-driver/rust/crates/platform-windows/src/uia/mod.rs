@@ -53,7 +53,6 @@ const MAX_TOTAL_ELEMENTS: usize = DEFAULT_MAX_TOTAL_ELEMENTS;
 /// Same shape for the UIA primary path AND the MSAA fallback (used for
 /// SAL/VCL window classes — see `msaa.rs`). MSAA-only fields use the
 /// `_ptr is IAccessible` / `msaa_role = Some(...)` discriminator.
-#[derive(Clone)]
 pub struct UiaNode {
     pub element_index: Option<usize>,
     pub control_type: String,
@@ -71,6 +70,10 @@ pub struct UiaNode {
     /// MSAA path) as usize. Retained — `Snapshots` Drop releases it via
     /// the `kind`-appropriate vtable.
     pub element_ptr: usize,
+    /// True only when `element_ptr` is an owned COM reference created by the
+    /// walker. Synthetic/test nodes can carry opaque non-zero identifiers
+    /// without being passed to IUnknown::Release.
+    pub owns_element_ptr: bool,
     /// Screen-coordinate center, captured at walk time to avoid later COM calls.
     pub center_x: i32,
     pub center_y: i32,
@@ -93,6 +96,77 @@ pub struct UiaNode {
     /// True when this node is below a UIA Document control. Browser-owned
     /// consent chrome must never match renderer-controlled descendants.
     pub in_web_content: bool,
+}
+
+impl Clone for UiaNode {
+    fn clone(&self) -> Self {
+        if self.owns_element_ptr {
+            retain_node_pointer(self.element_ptr, self.msaa_role);
+        }
+        Self {
+            element_index: self.element_index,
+            control_type: self.control_type.clone(),
+            name: self.name.clone(),
+            value: self.value.clone(),
+            automation_id: self.automation_id.clone(),
+            help_text: self.help_text.clone(),
+            actions: self.actions.clone(),
+            enabled: self.enabled,
+            selected: self.selected,
+            element_ptr: self.element_ptr,
+            owns_element_ptr: self.owns_element_ptr,
+            center_x: self.center_x,
+            center_y: self.center_y,
+            rect: self.rect,
+            msaa_role: self.msaa_role,
+            depth: self.depth,
+            parent_element_index: self.parent_element_index,
+            in_web_content: self.in_web_content,
+        }
+    }
+}
+
+impl Drop for UiaNode {
+    fn drop(&mut self) {
+        if self.owns_element_ptr {
+            release_node_pointer(self.element_ptr, self.msaa_role);
+        }
+        self.element_ptr = 0;
+    }
+}
+
+fn retain_node_pointer(ptr: usize, msaa_role: Option<i32>) {
+    if ptr == 0 {
+        return;
+    }
+    unsafe {
+        if msaa_role.is_some() {
+            use windows::Win32::UI::Accessibility::IAccessible;
+            let element = IAccessible::from_raw(ptr as *mut _);
+            let duplicate = element.clone();
+            std::mem::forget(element);
+            std::mem::forget(duplicate);
+        } else {
+            let element = IUIAutomationElement::from_raw(ptr as *mut _);
+            let duplicate = element.clone();
+            std::mem::forget(element);
+            std::mem::forget(duplicate);
+        }
+    }
+}
+
+fn release_node_pointer(ptr: usize, msaa_role: Option<i32>) {
+    if ptr == 0 {
+        return;
+    }
+    unsafe {
+        if msaa_role.is_some() {
+            use windows::Win32::UI::Accessibility::IAccessible;
+            drop(IAccessible::from_raw(ptr as *mut _));
+        } else {
+            drop(IUIAutomationElement::from_raw(ptr as *mut _));
+        }
+    }
 }
 
 pub struct UiaTreeResult {
@@ -149,17 +223,7 @@ fn exact_menu_path_matches(nodes: &[UiaNode], path: &[String]) -> Vec<usize> {
 }
 
 unsafe fn release_walk_nodes(nodes: Vec<UiaNode>) {
-    use windows::Win32::UI::Accessibility::IAccessible;
-    for node in nodes {
-        if node.element_ptr == 0 {
-            continue;
-        }
-        if node.msaa_role.is_some() {
-            drop(IAccessible::from_raw(node.element_ptr as *mut _));
-        } else {
-            drop(IUIAutomationElement::from_raw(node.element_ptr as *mut _));
-        }
-    }
+    drop(nodes);
 }
 
 unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result<(), String> {
@@ -854,6 +918,7 @@ fn emit_cached_node(
                 enabled,
                 selected,
                 element_ptr: ptr,
+                owns_element_ptr: true,
                 center_x,
                 center_y,
                 rect,
@@ -874,6 +939,7 @@ fn emit_cached_node(
                 enabled,
                 selected,
                 element_ptr: ptr,
+                owns_element_ptr: true,
                 center_x: 0,
                 center_y: 0,
                 rect: None,

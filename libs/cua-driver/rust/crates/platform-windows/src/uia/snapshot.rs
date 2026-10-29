@@ -104,15 +104,40 @@ impl UiaSnapshot {
         Self {
             elements: nodes
                 .iter()
-                .filter(|node| node.element_index.is_some())
-                .map(|node| RetainedElement {
-                    ptr: node.element_ptr,
-                    kind,
-                    center: (node.center_x, node.center_y),
-                    rect: node.rect,
-                    msaa_role: node.msaa_role,
+                .filter(|node| node.element_index.is_some() && node.owns_element_ptr)
+                .map(|node| {
+                    retain_raw(node.element_ptr, kind);
+                    RetainedElement {
+                        ptr: node.element_ptr,
+                        kind,
+                        center: (node.center_x, node.center_y),
+                        rect: node.rect,
+                        msaa_role: node.msaa_role,
+                    }
                 })
                 .collect(),
+        }
+    }
+}
+
+fn retain_raw(ptr: usize, kind: SnapshotKind) {
+    if ptr == 0 {
+        return;
+    }
+    unsafe {
+        match kind {
+            SnapshotKind::Uia => {
+                let element = IUIAutomationElement::from_raw(ptr as *mut _);
+                let duplicate = element.clone();
+                std::mem::forget(element);
+                std::mem::forget(duplicate);
+            }
+            SnapshotKind::Msaa => {
+                let element = IAccessible::from_raw(ptr as *mut _);
+                let duplicate = element.clone();
+                std::mem::forget(element);
+                std::mem::forget(duplicate);
+            }
         }
     }
 }

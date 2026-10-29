@@ -28,9 +28,7 @@ fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefus
 }
 
 fn release_nodes(nodes: &[UiaNode]) {
-    for node in nodes.iter().filter(|node| node.element_ptr != 0) {
-        unsafe { drop(IUIAutomationElement::from_raw(node.element_ptr as *mut _)) };
-    }
+    let _ = nodes;
 }
 
 // Own references before crossing the blocking-task boundary, including cancellation.
@@ -500,6 +498,7 @@ mod tests {
             enabled: None,
             selected: None,
             element_ptr: 0,
+            owns_element_ptr: false,
             center_x: 0,
             center_y: 0,
             rect: None,
@@ -520,6 +519,7 @@ mod tests {
         let mut node = node("Button", name, &["invoke"]);
         node.element_index = Some(element_ptr);
         node.element_ptr = element_ptr;
+        node.owns_element_ptr = false;
         node.rect = Some(rect);
         node.depth = 8;
         node
@@ -607,6 +607,7 @@ mod tests {
             }));
             let mut element = node("Button", "Allow", &["Invoke"]);
             element.element_ptr = ptr as usize;
+            element.owns_element_ptr = true;
             let owned = ConsentNodes(vec![element]);
             ready_tx.send(()).unwrap();
             finish_rx.recv().unwrap();
