@@ -162,6 +162,23 @@ unsafe fn release_walk_nodes(nodes: Vec<UiaNode>) {
     }
 }
 
+/// Release COM references held only for rendering content text. Actionable
+/// nodes stay retained because the snapshot store now owns their references.
+pub unsafe fn release_non_actionable_walk_nodes(nodes: &mut [UiaNode]) {
+    use windows::Win32::UI::Accessibility::IAccessible;
+    for node in nodes
+        .iter_mut()
+        .filter(|node| node.element_index.is_none() && node.element_ptr != 0)
+    {
+        if node.msaa_role.is_some() {
+            drop(IAccessible::from_raw(node.element_ptr as *mut _));
+        } else {
+            drop(IUIAutomationElement::from_raw(node.element_ptr as *mut _));
+        }
+        node.element_ptr = 0;
+    }
+}
+
 unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result<(), String> {
     let element =
         std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
