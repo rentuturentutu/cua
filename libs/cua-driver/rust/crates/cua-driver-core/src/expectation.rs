@@ -573,6 +573,30 @@ fn evaluate_element(
     } else {
         addressable
     };
+    // `label_contains` is intentionally useful for localized or dynamic labels,
+    // but a short value such as "A1" otherwise also matches A10/A11. When one
+    // or more candidates have the exact requested label, prefer that subset;
+    // duplicate exact labels still remain ambiguous below.
+    let matches = if let Some(needle) = predicate.selector.label_contains.as_deref() {
+        let exact_label = needle.to_lowercase();
+        let exact: Vec<&Value> = matches
+            .iter()
+            .copied()
+            .filter(|element| {
+                element
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .is_some_and(|label| label.to_lowercase() == exact_label)
+            })
+            .collect();
+        if exact.is_empty() {
+            matches
+        } else {
+            exact
+        }
+    } else {
+        matches
+    };
     if matches.is_empty() {
         let contains_untrusted_region = elements.iter().any(|element| {
             element.get("in_web_content").and_then(Value::as_bool) == Some(true)
@@ -658,7 +682,17 @@ fn evaluate_element(
                 Some(project_element(element)),
             );
         };
-        if actual != &expected {
+        let matches = if field == "value" {
+            match (actual.as_str(), expected.as_str()) {
+                (Some(actual_text), Some(expected_text)) => {
+                    normalize_line_endings(actual_text) == normalize_line_endings(expected_text)
+                }
+                _ => actual == &expected,
+            }
+        } else {
+            actual == &expected
+        };
+        if !matches {
             return (
                 VerificationStatus::Unsatisfied,
                 None,
@@ -671,6 +705,10 @@ fn evaluate_element(
         None,
         Some(project_element(element)),
     )
+}
+
+fn normalize_line_endings(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn selector_matches(selector: &cua_driver_contract::ElementSelector, element: &Value) -> bool {
@@ -724,31 +762,44 @@ fn target_is_in_web_area(target: &Value, elements: &[Value]) -> bool {
         })
         .collect();
     let mut current = Some(target);
+    let mut document_role_seen = false;
+    let mut explicit_flag_seen = false;
     for _ in 0..32 {
         let Some(element) = current else {
             break;
         };
-        if element.get("in_web_content").and_then(Value::as_bool) == Some(true) {
-            return true;
+        match element.get("in_web_content").and_then(Value::as_bool) {
+            Some(true) => return true,
+            Some(false) => explicit_flag_seen = true,
+            None => {}
         }
         if element
             .get("role")
             .and_then(Value::as_str)
             .is_some_and(|role| {
                 let normalized = role.to_ascii_lowercase().replace(['_', ' '], "");
-                normalized.contains("webarea")
-                    || normalized.contains("document")
-                    || normalized == "embedded"
+                normalized.contains("webarea") || normalized == "embedded"
             })
         {
             return true;
+        }
+        if element
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role.to_ascii_lowercase().contains("document"))
+        {
+            document_role_seen = true;
         }
         current = element
             .get("parent_index")
             .and_then(Value::as_u64)
             .and_then(|index| by_index.get(&index).copied());
     }
-    false
+    // Windows now publishes `in_web_content` on every structured element.
+    // An explicit false distinguishes native editors (Notepad, Word document
+    // surfaces) from renderer-owned web documents. Keep the role heuristic
+    // only as a fail-closed fallback for older providers that omit the flag.
+    document_role_seen && !explicit_flag_seen
 }
 
 fn project_element(element: &Value) -> Value {
@@ -959,6 +1010,56 @@ mod tests {
     }
 
     #[test]
+    fn exact_label_wins_over_contains_suffix_matches() {
+        let outcomes = evaluate_predicates(
+            &[labelled("A1", Some("5"))],
+            &observed(vec![
+                json!({
+                    "element_index": 1,
+                    "role": "DataItem",
+                    "label": "A1",
+                    "value": "5"
+                }),
+                json!({
+                    "element_index": 2,
+                    "role": "DataItem",
+                    "label": "A10",
+                    "value": "5"
+                }),
+                json!({
+                    "element_index": 3,
+                    "role": "DataItem",
+                    "label": "A11",
+                    "value": "5"
+                }),
+            ]),
+        );
+        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+    }
+
+    #[test]
+    fn unicode_exact_label_wins_over_contains_suffix_matches() {
+        let outcomes = evaluate_predicates(
+            &[labelled("ä1", Some("5"))],
+            &observed(vec![
+                json!({
+                    "element_index": 1,
+                    "role": "DataItem",
+                    "label": "Ä1",
+                    "value": "5"
+                }),
+                json!({
+                    "element_index": 2,
+                    "role": "DataItem",
+                    "label": "ä10",
+                    "value": "5"
+                }),
+            ]),
+        );
+        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+    }
+
+    #[test]
     fn display_only_web_text_stays_untrusted() {
         let outcomes = evaluate_predicates(
             &[labelled("Saved", Some("Saved"))],
@@ -1114,6 +1215,24 @@ mod tests {
                 Some(UnknownReason::UntrustedSource)
             );
         }
+    }
+
+    #[test]
+    fn native_document_with_explicit_non_web_flag_is_trusted() {
+        let outcomes = evaluate_predicates(
+            &[labelled(
+                "文本编辑器",
+                Some("计算结果 391\n路由回归-20261021"),
+            )],
+            &observed(vec![json!({
+                "element_index": 3,
+                "role": "Document",
+                "label": "文本编辑器",
+                "value": "计算结果 391\r\n路由回归-20261021",
+                "in_web_content": false
+            })]),
+        );
+        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
     }
 
     #[test]

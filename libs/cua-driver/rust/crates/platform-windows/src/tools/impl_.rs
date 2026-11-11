@@ -1109,6 +1109,11 @@ fn build_element_entry(
     }
     if n.in_web_content {
         entry["in_web_content"] = json!(true);
+    } else {
+        // Verification needs an explicit provenance bit. Without it, a native
+        // Document control (for example Notepad's editor) is indistinguishable
+        // from a renderer-owned web Document and is conservatively rejected.
+        entry["in_web_content"] = json!(false);
     }
     if let Some(label) = label {
         entry["label"] = json!(label);

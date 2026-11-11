@@ -37,3 +37,16 @@ fn element_entry_omits_actions_when_empty() {
     let entry = build_element_entry(&n, None).unwrap();
     assert!(entry.get("actions").is_none());
 }
+
+#[test]
+fn element_entry_distinguishes_native_and_web_documents() {
+    let mut native = node(Vec::new());
+    native.control_type = "Document".to_owned();
+    let native_entry = build_element_entry(&native, None).unwrap();
+    assert_eq!(native_entry["in_web_content"], json!(false));
+
+    let mut web = native;
+    web.in_web_content = true;
+    let web_entry = build_element_entry(&web, None).unwrap();
+    assert_eq!(web_entry["in_web_content"], json!(true));
+}
