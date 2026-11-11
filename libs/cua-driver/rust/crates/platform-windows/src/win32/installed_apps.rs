@@ -53,6 +53,14 @@ pub struct InstalledApp {
     /// RFC3339 mtime of the launcher (`.lnk` for desktop, package install
     /// path for UWP), when readable; `None` otherwise.
     pub last_used: Option<String>,
+    /// Exact timestamp represented by `last_used`. Retained separately so new
+    /// callers do not misinterpret launcher/package modification time as
+    /// actual user activity.
+    pub modified_at: Option<String>,
+    /// Executable basenames declared by UWP manifest Application entries.
+    /// They correlate ApplicationFrameHost windows with the packaged process
+    /// that owns the hosted CoreWindow.
+    pub uwp_executables: Vec<String>,
 }
 
 /// Aggregate Start-Menu shortcuts and UWP packages into one list.
@@ -60,22 +68,37 @@ pub struct InstalledApp {
 /// Errors from either source are swallowed — the goal is best-effort
 /// enumeration, not a guaranteed-complete catalog.
 pub fn list_installed_apps() -> Vec<InstalledApp> {
+    list_installed_apps_with_status().0
+}
+
+/// Aggregate installed applications and report the optional UWP scan status.
+pub fn list_installed_apps_with_status() -> (Vec<InstalledApp>, &'static str) {
     let mut out = Vec::new();
     let t0 = std::time::Instant::now();
     let sm = scan_start_menu();
     tracing::debug!(target: "installed_apps", "scan_start_menu: {} entries ({}ms)", sm.len(), t0.elapsed().as_millis());
     out.extend(sm);
     let t1 = std::time::Instant::now();
-    let uwp = scan_uwp_packages();
+    let (uwp, uwp_status) = scan_uwp_packages_with_status();
     tracing::debug!(target: "installed_apps", "scan_uwp_packages: {} entries ({}ms)", uwp.len(), t1.elapsed().as_millis());
     out.extend(uwp);
 
-    // Dedupe by (kind, bundle_id) — Start Menu may list both a per-user and a
-    // machine-wide shortcut for the same .exe target.
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|a| seen.insert((a.kind.clone(), a.bundle_id.clone())));
+    // Dedupe the exact launch entry. bundle_id alone is the target executable,
+    // so using it as the key would collapse different shortcut arguments.
+    dedupe_installed_apps(&mut out);
     out.sort_by(app_sort_key);
-    out
+    (out, uwp_status)
+}
+
+fn dedupe_installed_apps(apps: &mut Vec<InstalledApp>) {
+    let mut seen = std::collections::HashSet::new();
+    apps.retain(|app| {
+        seen.insert((
+            app.kind.clone(),
+            app.bundle_id.clone(),
+            app.launch_path.clone(),
+        ))
+    });
 }
 
 fn app_sort_key(a: &InstalledApp, b: &InstalledApp) -> std::cmp::Ordering {
@@ -197,7 +220,9 @@ fn resolve_lnk(lnk_path: &Path) -> Option<InstalledApp> {
         bundle_id: target,
         kind: "desktop".to_owned(),
         launch_path,
+        modified_at: last_used.clone(),
         last_used,
+        uwp_executables: Vec::new(),
     })
 }
 
@@ -332,25 +357,30 @@ where
     }
 }
 
-fn scan_uwp_packages() -> Vec<InstalledApp> {
+fn scan_uwp_packages_with_status() -> (Vec<InstalledApp>, &'static str) {
     match run_uwp_scan(
         uwp_scan_single_flight(),
         UWP_SCAN_TIMEOUT,
         scan_uwp_packages_unbounded,
     ) {
-        Ok(packages) => packages,
+        Ok(Ok(packages)) => (packages, "complete"),
+        Ok(Err(error)) => {
+            tracing::warn!(target: "installed_apps", "scan_uwp_packages: WinRT error: {error}");
+            (Vec::new(), "unavailable")
+        }
         Err(UwpScanDeadlineError::Busy) => {
             tracing::debug!(
                 target: "installed_apps",
                 "scan_uwp_packages: skipped while a prior WinRT query is in flight or cooling down"
             );
-            Vec::new()
+            (Vec::new(), "busy")
         }
-        Err(UwpScanDeadlineError::Timeout | UwpScanDeadlineError::Unavailable) => Vec::new(),
+        Err(UwpScanDeadlineError::Timeout) => (Vec::new(), "timed_out"),
+        Err(UwpScanDeadlineError::Unavailable) => (Vec::new(), "unavailable"),
     }
 }
 
-fn scan_uwp_packages_unbounded() -> Vec<InstalledApp> {
+fn scan_uwp_packages_unbounded() -> Result<Vec<InstalledApp>, String> {
     // Wrapped in catch_unwind because the WinRT activation path can panic on
     // very old Windows builds (pre-1809) that lack PackageManager altogether.
     let result = std::panic::catch_unwind(|| -> windows::core::Result<Vec<InstalledApp>> {
@@ -383,6 +413,9 @@ fn scan_uwp_packages_unbounded() -> Vec<InstalledApp> {
             if family_name.is_empty() {
                 continue;
             }
+            if looks_like_system_component_family(&family_name) {
+                continue;
+            }
 
             // (Frameworks: Visual C++ runtime, .NET shared assemblies,
             // language packs etc.) — we'd ideally filter via
@@ -405,19 +438,71 @@ fn scan_uwp_packages_unbounded() -> Vec<InstalledApp> {
                 continue;
             }
 
-            // Resolve manifest Application.Id when available so launch_path
-            // works for multi-entry packages too; fallback to "App" for
-            // compatibility with single-entry packages.
-            let app_id = read_uwp_application_id(&pkg).unwrap_or_else(|| "App".to_owned());
-            let launch_path = format!("shell:appsFolder\\{family_name}!{app_id}");
             let last_used = read_install_mtime(&pkg);
-
+            let manifest_applications = read_uwp_application_entries(&pkg);
+            let mut applications = Vec::new();
+            if let Ok(entries) = pkg.GetAppListEntries() {
+                for entry in entries {
+                    let Ok(aumid) = entry.AppUserModelId().map(|value| value.to_string()) else {
+                        continue;
+                    };
+                    if aumid.is_empty() {
+                        continue;
+                    }
+                    let application_id = aumid.split_once('!').map(|(_, id)| id).unwrap_or("App");
+                    let executable = manifest_applications
+                        .iter()
+                        .find(|(id, _)| id.eq_ignore_ascii_case(application_id))
+                        .map(|(_, executable)| executable.clone())
+                        .unwrap_or_default();
+                    let entry_display = entry
+                        .DisplayInfo()
+                        .ok()
+                        .and_then(|info| info.DisplayName().ok())
+                        .map(|value| value.to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| display.clone());
+                    applications.push((entry_display, aumid, executable));
+                }
+            }
+            if applications.is_empty() {
+                if let Some((application_id, executable)) = manifest_applications.first() {
+                    applications.push((
+                        display.clone(),
+                        format!("{family_name}!{application_id}"),
+                        executable.clone(),
+                    ));
+                } else {
+                    applications.push((
+                        display.clone(),
+                        format!("{family_name}!App"),
+                        String::new(),
+                    ));
+                }
+            }
+            let primary = select_primary_uwp_application(&applications);
+            let (entry_display, aumid, _) = applications[primary].clone();
+            let mut uwp_executables = applications
+                .iter()
+                .filter_map(|(_, _, executable)| {
+                    let basename = std::path::Path::new(executable)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(executable)
+                        .to_ascii_lowercase();
+                    (!basename.is_empty()).then_some(basename)
+                })
+                .collect::<Vec<_>>();
+            uwp_executables.sort();
+            uwp_executables.dedup();
             out.push(InstalledApp {
-                name: display,
-                bundle_id: family_name,
+                name: entry_display,
+                bundle_id: family_name.clone(),
                 kind: "uwp".to_owned(),
-                launch_path,
-                last_used,
+                launch_path: format!("shell:appsFolder\\{aumid}"),
+                modified_at: last_used.clone(),
+                last_used: last_used.clone(),
+                uwp_executables,
             });
         }
         Ok(out)
@@ -446,44 +531,110 @@ fn scan_uwp_packages_unbounded() -> Vec<InstalledApp> {
                      can't see. Cross-check with PowerShell `Get-AppxPackage`."
                 );
             }
-            v
+            Ok(v)
         }
-        Ok(Err(e)) => {
-            tracing::warn!(target: "installed_apps", "scan_uwp_packages: WinRT error: {e}");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::warn!(target: "installed_apps", "scan_uwp_packages: panicked (very old Windows?)");
-            Vec::new()
-        }
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("WinRT package scan panicked (very old Windows?)".to_owned()),
     }
 }
 
-/// Best-effort parse of AppxManifest.xml to extract the first Application Id.
-fn read_uwp_application_id(pkg: &windows::ApplicationModel::Package) -> Option<String> {
-    let base = pkg.InstalledPath().ok()?.to_string();
+/// Best-effort parse of every launchable Application entry in AppxManifest.xml.
+fn read_uwp_application_entries(pkg: &windows::ApplicationModel::Package) -> Vec<(String, String)> {
+    let Ok(base) = pkg.InstalledPath().map(|value| value.to_string()) else {
+        return Vec::new();
+    };
     if base.is_empty() {
-        return None;
+        return Vec::new();
     }
     let manifest = std::path::Path::new(&base).join("AppxManifest.xml");
-    let xml = std::fs::read_to_string(manifest).ok()?;
+    let Ok(xml) = std::fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    parse_uwp_application_entries(&xml)
+}
 
-    // Look for the first <Application ... Id="..."> start tag.
-    let app_pos = xml.find("<Application")?;
-    let tail = &xml[app_pos..];
-    let tag_end = tail.find('>')?;
-    let start_tag = &tail[..tag_end];
+fn parse_uwp_application_entries(xml: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut remaining = xml;
+    while let Some(start) = remaining.find("<Application") {
+        let tail = &remaining[start..];
+        let Some(end) = tail.find('>') else {
+            break;
+        };
+        let tag = &tail[..end];
+        if let Some(app_id) = xml_attribute(tag, "Id") {
+            let executable = xml_attribute(tag, "Executable").unwrap_or_default();
+            entries.push((app_id, executable));
+        }
+        remaining = &tail[end + 1..];
+    }
+    entries
+}
 
-    let id_key = "Id=\"";
-    let id_pos = start_tag.find(id_key)? + id_key.len();
-    let rest = &start_tag[id_pos..];
-    let id_end = rest.find('"')?;
-    let app_id = rest[..id_end].trim();
-    if app_id.is_empty() {
+fn xml_attribute(tag: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let start = tag.find(&marker)? + marker.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
         None
     } else {
-        Some(app_id.to_owned())
+        Some(value.to_owned())
     }
+}
+
+fn select_primary_uwp_application(entries: &[(String, String, String)]) -> usize {
+    if let Some(index) = entries
+        .iter()
+        .position(|(_, aumid, _)| uwp_application_id(aumid).eq_ignore_ascii_case("App"))
+    {
+        return index;
+    }
+    entries
+        .iter()
+        .position(|(_, aumid, _)| {
+            !looks_like_internal_uwp_application_id(uwp_application_id(aumid))
+        })
+        .unwrap_or(0)
+}
+
+fn uwp_application_id(aumid: &str) -> &str {
+    aumid.split_once('!').map(|(_, id)| id).unwrap_or("App")
+}
+
+fn looks_like_internal_uwp_application_id(application_id: &str) -> bool {
+    let value = application_id.to_ascii_lowercase();
+    value.starts_with("global.")
+        || [
+            "packagemetadata",
+            "mcpserver",
+            "protocolshim",
+            "redirector",
+            "comserver",
+            "commandrunner",
+            "nativehost",
+            "plugin",
+            "extension",
+            "service",
+            ".cdb",
+            ".kd",
+            ".ntsd",
+            ".dbgsrv",
+            "mcpproxy",
+        ]
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+fn looks_like_system_component_family(family_name: &str) -> bool {
+    let value = family_name.to_ascii_lowercase();
+    value.starts_with("microsoftwindows.")
+        || value.starts_with("microsoft.windows.shellexperiencehost_")
+        || value.starts_with("microsoft.windows.peopleexperiencehost_")
+        || value.starts_with("microsoft.windows.cloudexperiencehost_")
+        || value.starts_with("microsoft.windows.startmenuexperiencehost_")
+        || value.contains("winappruntime")
 }
 
 fn normalize_uwp_display_name(
@@ -586,6 +737,80 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
+
+    #[test]
+    fn parses_every_uwp_application_entry_and_executable() {
+        let entries = parse_uwp_application_entries(
+            r#"
+            <Package>
+              <Applications>
+                <Application Id="Main" Executable="app.exe" />
+                <Application Id="Secondary" Executable="nested\secondary.exe" />
+              </Applications>
+            </Package>
+            "#,
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ("Main".to_owned(), "app.exe".to_owned()),
+                ("Secondary".to_owned(), r"nested\secondary.exe".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_dedupe_preserves_distinct_shortcut_arguments() {
+        let first = InstalledApp {
+            name: "Chrome Profile 1".to_owned(),
+            bundle_id: r"C:\Chrome\chrome.exe".to_owned(),
+            kind: "desktop".to_owned(),
+            launch_path: r#""C:\Chrome\chrome.exe" --profile-directory="Profile 1""#.to_owned(),
+            last_used: None,
+            modified_at: None,
+            uwp_executables: Vec::new(),
+        };
+        let second = InstalledApp {
+            name: "Chrome Profile 2".to_owned(),
+            bundle_id: first.bundle_id.clone(),
+            kind: first.kind.clone(),
+            launch_path: r#""C:\Chrome\chrome.exe" --profile-directory="Profile 2""#.to_owned(),
+            last_used: None,
+            modified_at: None,
+            uwp_executables: Vec::new(),
+        };
+        let duplicate = first.clone();
+        let mut apps = vec![first, second, duplicate];
+        dedupe_installed_apps(&mut apps);
+        assert_eq!(apps.len(), 2);
+        assert_ne!(apps[0].launch_path, apps[1].launch_path);
+    }
+
+    #[test]
+    fn primary_uwp_entry_prefers_app_and_skips_internal_activations() {
+        let entries = vec![
+            (
+                "Example".to_owned(),
+                "Vendor.Example_pub!Global.ShellMcpServers".to_owned(),
+                "server.exe".to_owned(),
+            ),
+            (
+                "Example".to_owned(),
+                "Vendor.Example_pub!App".to_owned(),
+                "example.exe".to_owned(),
+            ),
+        ];
+        assert_eq!(select_primary_uwp_application(&entries), 1);
+        assert!(looks_like_internal_uwp_application_id(
+            "Global.ShellMcpServers"
+        ));
+        assert!(looks_like_system_component_family(
+            "MicrosoftWindows.Client.Core_cw5n1h2txyewy"
+        ));
+        assert!(!looks_like_system_component_family(
+            "Microsoft.Paint_8wekyb3d8bbwe"
+        ));
+    }
 
     #[test]
     fn shortcut_environment_target_resolves_without_changing_arguments() {

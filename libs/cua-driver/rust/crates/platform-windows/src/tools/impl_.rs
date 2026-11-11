@@ -734,115 +734,227 @@ impl Tool for ListAppsTool {
         //    that launch_path. Remaining installed entries are emitted with
         //    running=false, pid=0. Remaining running pids (no installed-app
         //    match) are emitted as running=true with launch_path=null.
-        let apps = tokio::task::spawn_blocking(|| -> Vec<serde_json::Value> {
-            use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-            use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        let (apps, uwp_scan_status) = match tokio::task::spawn_blocking(
+            || -> (Vec<serde_json::Value>, &'static str) {
+                use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+                use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
-            // Per-step timings logged via `tracing::debug!` (silent at default
-            // log level — enable with `RUST_LOG=cua_driver=debug` when debugging
-            // a slow list_apps invocation).
-            let t0 = std::time::Instant::now();
-            let wins = crate::win32::list_windows_via_win32(None);
-            tracing::debug!(target: "list_apps", "step 1 list_windows: {} wins ({}ms)", wins.len(), t0.elapsed().as_millis());
-            let mut seen_pids = std::collections::HashSet::new();
-            let mut running_pids: Vec<u32> = Vec::new();
-            for w in &wins {
-                if seen_pids.insert(w.pid) { running_pids.push(w.pid); }
-            }
-
-            let t1 = std::time::Instant::now();
-            let foreground_pid = unsafe {
-                let fg = GetForegroundWindow();
-                let mut pid = 0u32;
-                let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
-                pid
-            };
-            tracing::debug!(target: "list_apps", "step 2 fg-window: pid={} ({}ms)", foreground_pid, t1.elapsed().as_millis());
-
-            let t2 = std::time::Instant::now();
-            let procs = crate::win32::list_processes();
-            tracing::debug!(target: "list_apps", "step 3 list_processes: {} procs ({}ms)", procs.len(), t2.elapsed().as_millis());
-            let pid_to_name: std::collections::HashMap<u32, String> =
-                procs.iter().map(|p| (p.pid, p.name.clone())).collect();
-
-            let t3 = std::time::Instant::now();
-            let installed = crate::win32::list_installed_apps();
-            tracing::debug!(target: "list_apps", "step 4 list_installed_apps: {} installed ({}ms)", installed.len(), t3.elapsed().as_millis());
-            // Lowercase-exe-basename → installed-app indices. We match running
-            // processes by basename rather than full path because the process
-            // table's executable name is `notepad.exe` while the Start-Menu
-            // shortcut target is `C:\Windows\System32\notepad.exe` — both
-            // sides need to be normalised to compare. Multiple Start-Menu
-            // shortcuts often target the same basename (different `chrome.exe`
-            // launchers, multiple `code.exe` profiles, …), so we bucket as
-            // `Vec<usize>` and let `disambiguate_installed_match` pick a
-            // winner per running pid rather than letting the last write win.
-            let mut by_exe: std::collections::HashMap<String, Vec<usize>> =
-                std::collections::HashMap::new();
-            for (i, app) in installed.iter().enumerate() {
-                if app.kind == "desktop" {
-                    let basename = std::path::Path::new(&app.launch_path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    if !basename.is_empty() {
-                        by_exe.entry(basename).or_default().push(i);
+                // Per-step timings logged via `tracing::debug!` (silent at default
+                // log level — enable with `RUST_LOG=cua_driver=debug` when debugging
+                // a slow list_apps invocation).
+                let t0 = std::time::Instant::now();
+                let wins = crate::win32::list_windows_via_win32(None);
+                tracing::debug!(target: "list_apps", "step 1 list_windows: {} wins ({}ms)", wins.len(), t0.elapsed().as_millis());
+                let mut seen_pids = std::collections::HashSet::new();
+                let mut running_pids: Vec<u32> = Vec::new();
+                for w in &wins {
+                    if seen_pids.insert(w.pid) {
+                        running_pids.push(w.pid);
                     }
                 }
-            }
 
-            let mut consumed_installed: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let mut out: Vec<serde_json::Value> = Vec::new();
-
-            for &pid in &running_pids {
-                let name = pid_to_name.get(&pid).cloned().unwrap_or_else(|| "<unknown>".into());
-                let key = name.to_ascii_lowercase();
-                let candidates = by_exe.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
-                let merged = disambiguate_installed_match(candidates, &installed, &name);
-                if let Some(idx) = merged { consumed_installed.insert(idx); }
-                let (display_name, bundle_id, launch_path, kind, last_used) = match merged {
-                    Some(idx) => {
-                        let a = &installed[idx];
-                        (
-                            a.name.clone(),
-                            Some(a.bundle_id.clone()),
-                            Some(a.launch_path.clone()),
-                            Some(a.kind.clone()),
-                            a.last_used.clone(),
-                        )
-                    }
-                    None => (name, None, None, Some("desktop".to_owned()), None),
+                let t1 = std::time::Instant::now();
+                let foreground_pid = unsafe {
+                    let fg = GetForegroundWindow();
+                    let mut pid = 0u32;
+                    let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
+                    pid
                 };
-                out.push(json!({
-                    "pid":         pid,
-                    "bundle_id":   bundle_id,
-                    "name":        display_name,
-                    "running":     true,
-                    "active":      pid == foreground_pid,
-                    "kind":        kind,
-                    "launch_path": launch_path,
-                    "last_used":   last_used,
-                    "windows":     Vec::<serde_json::Value>::new(),
+                tracing::debug!(target: "list_apps", "step 2 fg-window: pid={} ({}ms)", foreground_pid, t1.elapsed().as_millis());
+
+                let t2 = std::time::Instant::now();
+                let procs = crate::win32::list_processes();
+                tracing::debug!(target: "list_apps", "step 3 list_processes: {} procs ({}ms)", procs.len(), t2.elapsed().as_millis());
+                let pid_to_name: std::collections::HashMap<u32, String> =
+                    procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+
+                let t3 = std::time::Instant::now();
+                let (installed, uwp_scan_status) =
+                    crate::win32::list_installed_apps_with_status();
+                tracing::debug!(target: "list_apps", "step 4 list_installed_apps: {} installed ({}ms)", installed.len(), t3.elapsed().as_millis());
+
+                // ApplicationFrameHost owns every modern UWP top-level frame,
+                // while the packaged process owns a child CoreWindow. Resolve
+                // that relationship before matching manifest executables.
+                let mut uwp_windows: std::collections::HashMap<
+                    u32,
+                    Vec<serde_json::Value>,
+                > = std::collections::HashMap::new();
+                let mut uwp_seen_pids = std::collections::HashSet::new();
+                for window in &wins {
+                    let host_name = pid_to_name.get(&window.pid).map(String::as_str).unwrap_or("");
+                    if !host_name.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+                        continue;
+                    }
+                    let Some(app_pid) =
+                        crate::win32::resolve_uwp_app_pid(window.pid, window.hwnd)
+                    else {
+                        continue;
+                    };
+                    uwp_windows.entry(app_pid).or_default().push(json!({
+                        "pid": window.pid,
+                        "window_id": window.hwnd,
+                        "title": window.title,
+                    }));
+                    if uwp_seen_pids.insert(app_pid) {
+                        running_pids.push(app_pid);
+                    }
+                }
+                running_pids.retain(|pid| {
+                    !pid_to_name
+                        .get(pid)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
+                });
+
+                let mut by_exe: std::collections::HashMap<String, Vec<usize>> =
+                    std::collections::HashMap::new();
+                let mut by_path: std::collections::HashMap<String, Vec<usize>> =
+                    std::collections::HashMap::new();
+                let mut by_uwp_executable: std::collections::HashMap<String, Vec<usize>> =
+                    std::collections::HashMap::new();
+                for (i, app) in installed.iter().enumerate() {
+                    if app.kind == "desktop" {
+                        let path = normalized_process_path(&app.bundle_id);
+                        if !path.is_empty() {
+                            by_path.entry(path).or_default().push(i);
+                        }
+                        let basename = std::path::Path::new(&app.bundle_id)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if !basename.is_empty() {
+                            by_exe.entry(basename).or_default().push(i);
+                        }
+                    } else {
+                        for executable in &app.uwp_executables {
+                            by_uwp_executable
+                                .entry(executable.to_ascii_lowercase())
+                                .or_default()
+                                .push(i);
+                        }
+                    }
+                }
+
+                let pid_to_path: std::collections::HashMap<u32, String> = running_pids
+                    .iter()
+                    .filter_map(|pid| {
+                        crate::win32::process_image_path(*pid)
+                            .map(|path| (*pid, normalized_process_path(&path)))
+                    })
+                    .collect();
+                let mut consumed_installed: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                let mut out: Vec<serde_json::Value> = Vec::new();
+
+                for &pid in &running_pids {
+                    let name = pid_to_name
+                        .get(&pid)
+                        .cloned()
+                        .unwrap_or_else(|| "<unknown>".into());
+                    let key = name.to_ascii_lowercase();
+                    let path_candidates = pid_to_path
+                        .get(&pid)
+                        .and_then(|path| by_path.get(path))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let candidates = if path_candidates.is_empty() {
+                        by_exe.get(&key).map(Vec::as_slice).unwrap_or(&[])
+                    } else {
+                        path_candidates
+                    };
+                    let mut merged = disambiguate_installed_match(candidates, &installed, &name);
+                    if merged.is_none() {
+                        merged = by_uwp_executable
+                            .get(&key)
+                            .and_then(|indices| {
+                                disambiguate_installed_match(indices, &installed, &name)
+                            });
+                    }
+                    if let Some(idx) = merged {
+                        consumed_installed.insert(idx);
+                    }
+                    let windows_for_pid =
+                        uwp_windows.remove(&pid).unwrap_or_else(Vec::new);
+                    let active = pid == foreground_pid
+                        || windows_for_pid.iter().any(|window| {
+                            window["pid"].as_u64() == Some(foreground_pid as u64)
+                        });
+                    let (display_name, bundle_id, launch_path, kind, last_used, modified_at) =
+                        match merged {
+                        Some(idx) => {
+                            let app = &installed[idx];
+                            (
+                                app.name.clone(),
+                                Some(app.bundle_id.clone()),
+                                Some(app.launch_path.clone()),
+                                Some(app.kind.clone()),
+                                app.last_used.clone(),
+                                app.modified_at.clone(),
+                            )
+                        }
+                        None => (
+                            name,
+                            None,
+                            None,
+                            Some("desktop".to_owned()),
+                            None,
+                            None,
+                        ),
+                    };
+                    let last_used_source = if kind.as_deref() == Some("uwp") {
+                        "package_mtime"
+                    } else {
+                        "launcher_mtime"
+                    };
+                    out.push(json!({
+                        "pid":         pid,
+                        "bundle_id":   bundle_id,
+                        "name":        display_name,
+                        "running":     true,
+                        "active":      active,
+                        "kind":        kind,
+                        "launch_path": launch_path,
+                        "last_used":   last_used,
+                        "last_used_source": last_used_source,
+                        "modified_at": modified_at,
+                        "windows":     windows_for_pid,
+                    }));
+                }
+                for (i, app) in installed.iter().enumerate() {
+                    if consumed_installed.contains(&i) {
+                        continue;
+                    }
+                    out.push(json!({
+                        "pid":         0,
+                        "bundle_id":   app.bundle_id.clone(),
+                        "name":        app.name.clone(),
+                        "running":     false,
+                        "active":      false,
+                        "kind":        app.kind.clone(),
+                        "launch_path": app.launch_path.clone(),
+                        "last_used":   app.last_used.clone(),
+                    "last_used_source": if app.kind == "uwp" { "package_mtime" } else { "launcher_mtime" },
+                    "modified_at": app.modified_at.clone(),
+                        "windows":     Vec::<serde_json::Value>::new(),
+                    }));
+                }
+                (out, uwp_scan_status)
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "catalog_unavailable: list_apps worker failed: {error}"
+                ))
+                .with_structured(json!({
+                    "code": "catalog_unavailable",
+                    "message": error.to_string(),
                 }));
             }
-            for (i, app) in installed.iter().enumerate() {
-                if consumed_installed.contains(&i) { continue }
-                out.push(json!({
-                    "pid":         0,
-                    "bundle_id":   app.bundle_id.clone(),
-                    "name":        app.name.clone(),
-                    "running":     false,
-                    "active":      false,
-                    "kind":        app.kind.clone(),
-                    "launch_path": app.launch_path.clone(),
-                    "last_used":   app.last_used.clone(),
-                    "windows":     Vec::<serde_json::Value>::new(),
-                }));
-            }
-            out
-        }).await.unwrap_or_default();
+        };
 
         let running_count = apps
             .iter()
@@ -869,6 +981,10 @@ impl Tool for ListAppsTool {
                 .map(|a| json!({
                     "pid":  a["pid"], "name": a["name"]
                 })).collect::<Vec<_>>(),
+            "catalogCompleteness": {
+                "desktopShortcuts": "complete",
+                "uwpPackages": uwp_scan_status,
+            },
         });
         ToolResult::text(lines.join("\n")).with_structured(structured)
     }
@@ -905,6 +1021,13 @@ fn disambiguate_installed_match(
                 .cmp(installed[b].last_used.as_deref().unwrap_or(""))
         })
         .or_else(|| candidates.first().copied())
+}
+
+fn normalized_process_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 // ── list_windows ─────────────────────────────────────────────────────────────
@@ -1404,7 +1527,7 @@ impl Tool for GetWindowStateTool {
             let tree_task = tokio::task::spawn_blocking(move || {
                 let mut budget =
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements);
-                let tree =
+                let mut tree =
                     crate::uia::walk_tree_budgeted(hwnd, q.as_deref(), max_depth, &mut budget);
                 let kind = if tree.nodes.iter().any(|node| node.msaa_role.is_some()) {
                     crate::uia::snapshot::SnapshotKind::Msaa
@@ -1412,6 +1535,9 @@ impl Tool for GetWindowStateTool {
                     crate::uia::snapshot::SnapshotKind::Uia
                 };
                 let payload = crate::uia::snapshot::UiaSnapshot::from_nodes(&tree.nodes, kind);
+                unsafe {
+                    crate::uia::release_non_actionable_walk_nodes(&mut tree.nodes);
+                }
                 (tree, payload, budget.outcome())
             });
             let started = std::time::Instant::now();

@@ -3,9 +3,13 @@
 //! Uses CreateToolhelp32Snapshot / Process32FirstW / Process32NextW (simpler
 //! and more portable than NtQuerySystemInformation or EnumProcesses+psapi).
 
+use windows::core::PWSTR;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 #[derive(Debug, Clone)]
@@ -45,6 +49,32 @@ pub fn list_processes() -> Vec<ProcessInfo> {
         let _ = CloseHandle(snap);
     }
     result
+}
+
+/// Resolve a live process's full executable path without requiring elevated
+/// access to unrelated processes. Returns `None` when the process exits or its
+/// image path is not readable.
+pub fn process_image_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = vec![0u16; 32768];
+    let mut length = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    if result.is_err() || length == 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(String::from_utf16_lossy(&buffer))
 }
 
 fn decode_wstr(buf: &[u16]) -> String {

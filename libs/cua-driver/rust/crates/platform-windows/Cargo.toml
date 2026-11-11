@@ -75,6 +75,7 @@ windows = { version = "0.58", features = [
     # WinRT for UWP package enumeration via PackageManager.
     "Management_Deployment",
     "ApplicationModel",
+    "ApplicationModel_Core",
     "Foundation_Collections",
     # Windows.Graphics.Capture (WGC) - the supported way to capture
     # UWP / DirectComposition windows even when they're occluded by
